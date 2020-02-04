@@ -97,7 +97,7 @@ install:
   - docker exec -i $DOCK sh -c '
         cd /home &&
         source scl_source enable devtoolset-8 &&
-        git clone -b release https://github.com/neilstephens/opendatacon.git odcsrc &&
+        git clone -b master https://github.com/neilstephens/opendatacon.git odcsrc &&
         ls -l &&
         cd odcsrc &&
         mkdir build &&
