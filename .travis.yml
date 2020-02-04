@@ -1,0 +1,163 @@
+# Build OpenDataCon, Kafka C Libs and Python Kafka libs in OEL7, which is what it will run on in production
+# We have to install all the build tools and source code to do this.
+# The result is deployed binaries, usually to the draft github repo, where we can turn them into "real"releases.
+#
+# We could run a Python kafka consumer on this instance so that we can capture the messages sent from OEL7 to the kafka instance
+# Python is part of minimal anyway.
+# 04-02-2020 - Contains Neils TCP keep alive fixes
+
+language: python
+
+git: 
+  depth: false # We might not need anything from git at this level?
+  
+services:
+  - docker
+
+env:
+  - BUILD_CONFIG=Release
+
+dist: bionic
+
+branches:
+  only:
+    - master
+
+before_install:
+  - echo "Testing Docker Hub credentials"
+  
+install:
+  - export SRC_DIR=$(pwd)
+  # Run the docker image and keep the returned container name for use in exec calls.
+  # Run detatched, the volume command is -v hostdir:containerdir, -rm indicates cleanup on exit unnamed vols, 
+  # -ti maintain a terminal, the docker image is oraclelinux:7.6
+  - DOCK=$(docker run --cap-add SYS_ADMIN -d -v $(pwd):/mnt/build --rm -ti library/oraclelinux:7.6)
+  # Need -y option on everything so it does not wait for input!!
+  - docker exec -i $DOCK sh -c '
+        yum install -y oracle-softwarecollection-release-el7 &&
+        /usr/bin/ol_yum_configure.sh &&
+        yum repolist &&
+        yum install -y scl-utils glibc-devel iso-codes redhat-rpm-config libmicrohttpd git make applydeltarpm tar &&
+        yum install -y devtoolset-8-gcc-c++ &&
+        source scl_source enable devtoolset-8 &&
+        gcc --version &&
+        g++ --version 
+      '
+
+  - docker exec -i $DOCK sh -c '
+        mkdir /mnt/build/rpms &&
+        cd /home &&
+        curl -O http://packages.psychotic.ninja/7/plus/x86_64/RPMS//libmodbus-devel-3.0.6-2.el7.psychotic.x86_64.rpm &&
+        curl -O http://packages.psychotic.ninja/7/plus/x86_64/RPMS//libmodbus-3.0.6-2.el7.psychotic.x86_64.rpm &&
+        rpm -i libmodbus-3.0.6-2.el7.psychotic.x86_64.rpm &&
+        rpm -i libmodbus-devel-3.0.6-2.el7.psychotic.x86_64.rpm &&
+        curl -O http://public-yum.oracle.com/repo/OracleLinux/OL7/optional/developer/x86_64/getPackage/scl-utils-build-20130529-19.el7.x86_64.rpm &&
+        cp -av scl-utils-build-20130529-19.el7.x86_64.rpm /mnt/build/rpms &&
+        rpm -i scl-utils-build-20130529-19.el7.x86_64.rpm &&
+        curl -O https://public-yum.oracle.com/repo/OracleLinux/OL7/optional/latest/x86_64/getPackage/libmicrohttpd-devel-0.9.33-2.el7.x86_64.rpm &&
+        rpm -i libmicrohttpd-devel-0.9.33-2.el7.x86_64.rpm &&
+        rm *.rpm
+      '
+          # a two stage install process, to duplicate what we need to do in OTE. Also make the rpm files build artifacts.
+  - docker exec -i $DOCK sh -c '
+        yumdownloader --downloadonly --destdir /mnt/build/rpms --resolve rh-python36 rh-python36-python-devel &&
+        yum install -y /mnt/build/rpms/*.rpm &&
+        source scl_source enable rh-python36 &&
+        python --version
+        '
+  - docker exec -i $DOCK sh -c '
+        yum install -y cmake3-3.12.2 file &&
+        ln -s /usr/bin/cmake3 /bin/cmake &&
+        cmake --version 
+      '
+
+  - docker exec -i $DOCK sh -c '
+        cd /home &&
+        yum install -y libzstd &&
+        source scl_source enable devtoolset-8 &&
+        git clone --depth 1 https://github.com/edenhill/librdkafka librdkafka &&
+        cd librdkafka &&
+        ./configure --source-deps-only &&
+        make &&
+        make install &&
+        cd ..
+        '
+        # Result is $DESTDIR/usr/local/lib/librdkafka++.so.1
+  - docker exec -i $DOCK sh -c '
+        cd /home &&
+        source scl_source enable devtoolset-8 &&
+        source scl_source enable rh-python36 &&
+        git clone --depth 1 https://github.com/confluentinc/confluent-kafka-python confluent-kafka-python &&
+        cd confluent-kafka-python &&
+        python setup.py build &&
+        cp -avr /home/confluent-kafka-python/build/lib.linux-x86_64-3.6/confluent_kafka/ /opt/rh/rh-python36/root/usr/lib/python3.6/site-packages &&
+        cd .. 
+        '
+        # Result is  ...
+  - docker exec -i $DOCK sh -c '
+        cd /home &&
+        source scl_source enable devtoolset-8 &&
+        git clone -b release https://github.com/neilstephens/opendatacon.git odcsrc &&
+        ls -l &&
+        cd odcsrc &&
+        mkdir build &&
+        cd build &&
+        cmake -DPYTHON_HOME=/opt/rh/rh-python36/root/usr -DFULL=ON -DCMAKE_INSTALL_PREFIX=/home/install  .. &&
+        make -j3 &&
+        make package &&
+        make install &&
+        pwd 
+      '
+  - export RUN="docker exec --interactive --workdir /mnt/build $DOCK"
+  - export STOP="docker stop $DOCK"
+    
+script:
+  # Get a fulldir listing into a log file that we can look at later to find things!
+  #- docker exec -i $DOCK sh -c '
+  #      ls -lR / > dirlisting.log 
+  #      '
+  - $RUN ls -lR / > dirlisting.log
+  - $RUN ls -la /usr/local/lib
+  - $RUN ls -la /home/odcsrc/build
+  - $RUN ls -la /mnt/build/rpms 
+  - $RUN ls -la /opt/rh/rh-python36/root/usr/lib/python3.6/site-packages/confluent_kafka
+  - docker exec -i $DOCK sh -c ' cp /home/odcsrc/build/*.sh /mnt/build/ '
+  # Put the targets in /mnt/build so they appear in the home folder in the controlling OS
+  - $RUN tar -zcvf /mnt/build/rh_python36rpms.tgz -C /mnt/build/rpms .
+  - $RUN tar -zcvf /mnt/build/kafkalibs_oel7.tgz /usr/local/lib /opt/rh/rh-python36/root/usr/lib/python3.6/site-packages/confluent_kafka
+  #- $RUN tar -zcvf /mnt/build/kafkalibs_oel72.tgz /opt/rh/rh-python36/root/usr/lib/python3.6/site-packages/confluent_kafka
+  - ls -la
+  # Copy the two specific files for this test into the docker container
+#  - docker exec -i $DOCK sh -c '
+#        /bin/cp -rf /mnt/build/opendatacon.conf /home/opendatacon.conf &&
+#        /bin/cp -rf /mnt/build/PyPortKafka.py /home/odcsrc/build/build/PyPortKafka.py && 
+#        source scl_source enable rh-python36 &&
+#        export PYTHON_HOME="/opt/rh/rh-python36/root/usr" &&
+#        cd /home/odcsrc/build/build &&
+#        LD_LIBRARY_PATH=/usr/local/lib ./opendatacon -c "/home/opendatacon.conf"
+#        '
+  - $STOP
+    
+deploy:
+  # Upload testing log files and deploy packages for all develop builds. Searches recursively for all .log files.
+  provider: releases
+  api_key:
+    secure:    bmcbUeZrlPdmg3EbFdk+uk4MaVweV85BIEE3UC6P/KjbUGe1GOS5ZMEHDffxfIrCWgpOKTyoKCmmBPnKM7BG5Z823ojgmhfs0YJ14IlwfEITcOIFTAs3giey1vYGbtAn5Rsk8z9LRL2nwZWg7iHblv7gTE8+/tFNgvcm6qPGtNH6+hcMV1/JVD4k99PSliJp3l34LOdFHeXVK7T+cKVGWUH0MrTuk80fzjRlroso65XtdzrzW9OhBg+DnVQn7luTsb7HF9a/CswkOsWucah4XVZSLB6LRuZ9O9Bj4Z80nhuVQGHxQSN6+8Y67ht2tV8DFQdDcNx+WCcOfRWBfBXM21xyGaXxfSkZq2NumCqiy+I9ZRglR5LCP8RQsyagwADVJhnAF7+mMEal/2zyukWFolO4/1IDgY9GgnCZhqe8e+EmHarHSBIe/6JmHVSgWsqzHl+i7bH5WbxWlkHU48FhF+DCZEj8wsX/OUrJy8iNbDAlw7IPf0jsV1DaIGx5zVGb4T3sIknM8QbfQJc1LWyqjheZBTGX34fTql7PKbts3Dy8wjCazHBClQTXDDNUIbJScLnKfPQe4EIs1BYA6dQOrcuvWZNPkO+ju5VyXm/LED0p7EXLTR3ZxbG2+9dy8RUgHQ78NqXXUmCD1EsQ4JJ1XpXYI2NKfG0Hb1OUhxXaBH4=
+  file_glob: true
+  file: 
+    - ./**/*.log
+    - kafkalibs_oel7.tgz
+    - rh_python36rpms.tgz
+    - opendatacon-*.sh
+  name: "opendatacon_release_oel7.6 ${TRAVIS_TAG}"
+  skip_cleanup: true
+  draft: true
+  overwrite: true
+  on:
+    branch: master
+    repo: ScottEllisNovatex/OpenDataCon_OEL7
+   
+
+
+   
+
